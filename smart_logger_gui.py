@@ -23,13 +23,20 @@ STATUS_FILE = BASE_DIR / "status.txt"
 BACKEND_NAME = "smart_logger_shell.sh"
 BASH_PATH = r"C:\Program Files\Git\bin\bash.exe"
 
+CPU_ALERT_LIMIT = 80
+MEM_ALERT_LIMIT = 80
+DISK_ALERT_LIMIT = 90
+PROC_ALERT_LIMIT = 350
+
 
 class CpuGraphWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.values = deque(maxlen=60)
         self.setMinimumHeight(280)
-        self.setStyleSheet("background-color: #101317; border: 1px solid #444; border-radius: 8px;")
+        self.setStyleSheet(
+            "background-color: #101317; border: 1px solid #444; border-radius: 8px;"
+        )
 
     def set_values(self, vals):
         self.values = deque(vals, maxlen=60)
@@ -95,7 +102,9 @@ class AlertPopup(QDialog):
         super().__init__(parent)
         self.setWindowTitle("ALERT")
         self.setModal(False)
-        self.setFixedSize(360, 170)
+        self.setFixedSize(380, 190)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.setWindowFlag(Qt.WindowType.Tool, True)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
@@ -103,12 +112,14 @@ class AlertPopup(QDialog):
 
         self.icon = QLabel("❗")
         self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.icon.setStyleSheet("font-size: 36px; color: red; font-weight: bold;")
+        self.icon.setStyleSheet("font-size: 38px; color: red; font-weight: bold;")
 
         self.text_label = QLabel("")
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.text_label.setWordWrap(True)
-        self.text_label.setStyleSheet("font-size: 18px; color: #ff4d4d; font-weight: bold;")
+        self.text_label.setStyleSheet(
+            "font-size: 18px; color: #ff4d4d; font-weight: bold;"
+        )
 
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.close)
@@ -136,8 +147,13 @@ class AlertPopup(QDialog):
             }
         """)
 
+        self.auto_close_timer = QTimer(self)
+        self.auto_close_timer.setSingleShot(True)
+        self.auto_close_timer.timeout.connect(self.close)
+
     def set_message(self, msg):
         self.text_label.setText(msg)
+        self.auto_close_timer.start(5000)
 
 
 class SmartLogger(QMainWindow):
@@ -149,6 +165,8 @@ class SmartLogger(QMainWindow):
         self.backend_process = None
         self.last_alert_key = ""
         self.alert_popup = None
+        self.last_status_timestamp = ""
+        self.stale_count = 0
 
         self.init_ui()
         self.apply_dark_theme()
@@ -326,9 +344,16 @@ class SmartLogger(QMainWindow):
                 QMessageBox.critical(self, "Error", f"Shell file not found:\n{shell_path}")
                 return
 
+            bash_exe = Path(BASH_PATH)
+            if not bash_exe.exists():
+                QMessageBox.critical(self, "Error", f"Bash not found:\n{BASH_PATH}")
+                return
+
             self.backend_process = subprocess.Popen(
-                [BASH_PATH, "-lc", f"bash {BACKEND_NAME}"],
-                cwd=str(BASE_DIR)
+                [str(bash_exe), str(shell_path)],
+                cwd=str(BASE_DIR),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
         except Exception as e:
             QMessageBox.critical(self, "Backend Error", f"Could not start backend.\n\n{e}")
@@ -389,61 +414,96 @@ class SmartLogger(QMainWindow):
             pass
         return vals
 
+    def write_alert_log(self, message):
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [ALERT] {message}\n")
+        except Exception:
+            pass
+
+    def show_alert_popup(self, message):
+        if self.alert_popup:
+            self.alert_popup.close()
+            self.alert_popup.deleteLater()
+
+        self.alert_popup = AlertPopup(self)
+        self.alert_popup.set_message(message)
+        self.alert_popup.show()
+        self.alert_popup.raise_()
+        self.alert_popup.activateWindow()
+        QApplication.alert(self)
+
+    def handle_alert(self, cpu, mem, disk, proc, timestamp):
+        alerts = []
+
+        if cpu >= CPU_ALERT_LIMIT:
+            alerts.append(f"High CPU Usage Detected\nCPU reached {cpu}%")
+
+        if mem >= MEM_ALERT_LIMIT:
+            alerts.append(f"High Memory Usage Detected\nMemory reached {mem}%")
+
+        if disk >= DISK_ALERT_LIMIT:
+            alerts.append(f"High Disk Usage Detected\nDisk reached {disk}%")
+
+        if proc >= PROC_ALERT_LIMIT:
+            alerts.append(f"Too Many Processes Running\nProcesses count: {proc}")
+
+        if timestamp:
+            if timestamp == self.last_status_timestamp:
+                self.stale_count += 1
+            else:
+                self.stale_count = 0
+                self.last_status_timestamp = timestamp
+
+            if self.stale_count >= 2:
+                alerts.append("Backend Not Updating\nStatus file seems stuck")
+        else:
+            alerts.append("Status file missing timestamp")
+
+        if not alerts:
+            if self.alert_popup and self.alert_popup.isVisible():
+                self.alert_popup.close()
+            self.last_alert_key = ""
+            return
+
+        alert_key = " | ".join(alerts)
+        if alert_key == self.last_alert_key:
+            return
+
+        self.last_alert_key = alert_key
+        self.write_alert_log(alert_key.replace("\n", " | "))
+        self.show_alert_popup("\n\n".join(alerts))
+
     def refresh(self):
         if LOG_FILE.exists():
             lines = LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
             self.logs.setPlainText("\n".join(lines[-40:]))
 
         status = self.read_status()
-        if status:
-            try:
-                cpu = int(status.get("CPU", "0"))
-                mem = int(status.get("MEM", "0"))
-
-                self.cpu_label.setText(f"CPU: {cpu}%")
-                self.mem_label.setText(f"Memory: {mem}%")
-
-                self.cpu_bar.setValue(cpu)
-                self.mem_bar.setValue(mem)
-
-                self.update_bar_color(self.cpu_bar, cpu)
-                self.update_bar_color(self.mem_bar, mem)
-
-                self.handle_alert(cpu, mem)
-            except Exception:
-                pass
-
-    def handle_alert(self, cpu, mem):
-        alert_msg = ""
-        alert_key = ""
-
-        if cpu >= 80:
-            alert_msg = f"High CPU Usage Detected\nCPU reached {cpu}%"
-            alert_key = f"CPU-{cpu}"
-        elif mem >= 80:
-            alert_msg = f"High Memory Usage Detected\nMemory reached {mem}%"
-            alert_key = f"MEM-{mem}"
-
-        if not alert_msg:
-            if self.alert_popup and self.alert_popup.isVisible():
-                self.alert_popup.close()
-            self.last_alert_key = ""
+        if not status:
+            self.handle_alert(0, 0, 0, 0, "")
             return
 
-        if alert_key == self.last_alert_key:
-            return
+        try:
+            cpu = int(status.get("CPU", "0"))
+            mem = int(status.get("MEM", "0"))
+            disk = int(status.get("DISK", "0"))
+            proc = int(status.get("PROC", "0"))
+            timestamp = status.get("TIMESTAMP", "")
 
-        self.last_alert_key = alert_key
+            self.cpu_label.setText(f"CPU: {cpu}%")
+            self.mem_label.setText(f"Memory: {mem}%")
 
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} [ALERT] {alert_msg.replace(chr(10), ' | ')}\n")
+            self.cpu_bar.setValue(cpu)
+            self.mem_bar.setValue(mem)
 
-        if self.alert_popup and self.alert_popup.isVisible():
-            self.alert_popup.close()
+            self.update_bar_color(self.cpu_bar, cpu)
+            self.update_bar_color(self.mem_bar, mem)
 
-        self.alert_popup = AlertPopup(self)
-        self.alert_popup.set_message(alert_msg)
-        self.alert_popup.show()
+            self.handle_alert(cpu, mem, disk, proc, timestamp)
+
+        except Exception as e:
+            self.write_alert_log(f"GUI refresh error: {e}")
 
     def add_log(self):
         msg = self.msg_box.text().strip()
@@ -540,7 +600,10 @@ class SmartLogger(QMainWindow):
         backup = archive_dir / "log_backup.txt"
 
         if LOG_FILE.exists():
-            backup.write_text(LOG_FILE.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+            backup.write_text(
+                LOG_FILE.read_text(encoding="utf-8", errors="ignore"),
+                encoding="utf-8"
+            )
             LOG_FILE.write_text("", encoding="utf-8")
             QMessageBox.information(self, "Archive", "Logs archived successfully.")
             self.refresh()
@@ -551,7 +614,10 @@ class SmartLogger(QMainWindow):
         backup = BASE_DIR / "archives" / "log_backup.txt"
 
         if backup.exists():
-            LOG_FILE.write_text(backup.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+            LOG_FILE.write_text(
+                backup.read_text(encoding="utf-8", errors="ignore"),
+                encoding="utf-8"
+            )
             QMessageBox.information(self, "Restore", "Logs restored successfully.")
             self.refresh()
         else:
